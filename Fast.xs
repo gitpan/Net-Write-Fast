@@ -1,0 +1,556 @@
+/* $Id: Fast.xs 10 2011-11-16 22:03:53Z gomor $ */
+
+#include "EXTERN.h"
+#include "perl.h"
+#include "XSUB.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <netinet/in.h>
+
+//#define DEBUG  1
+
+//#define TCP_LEN       24
+//#define TCP_OPT_LEN    4
+#define TCP_LEN       40
+#define TCP_OPT_LEN   20
+#define TCP_PHDR4_LEN 12
+#define TCP_PHDR6_LEN 36
+
+#define MAXERRBUF 1024
+
+char nwf_errbuf[MAXERRBUF];
+int  nwf_isrand = 0;
+
+struct tcphdr {
+   u_int16_t th_sport;
+   u_int16_t th_dport;
+   u_int32_t th_seq;
+   u_int32_t th_ack;
+   u_int8_t  th_x2:4, th_off:4;
+   u_int8_t  th_flags;
+   u_int16_t th_win;
+   u_int16_t th_sum;
+   u_int16_t th_urp;
+};
+
+struct ptcphdr4 {
+   in_addr_t ip_src;
+   in_addr_t ip_dst;
+   u_int16_t ip_p;
+   u_int16_t tcp_len;
+   struct tcphdr tcp_hdr;
+   u_int8_t tcp_opt[TCP_OPT_LEN];
+};
+
+struct ptcphdr6 {
+   struct in6_addr ip_src;
+   struct in6_addr ip_dst;
+   u_int16_t ip_p;
+   u_int16_t tcp_len;
+   struct tcphdr tcp_hdr;
+   u_int8_t tcp_opt[TCP_OPT_LEN];
+};
+
+u_int16_t
+_nwf_csum(u_int16_t *buf, int nwords)
+{
+   u_int32_t sum;
+
+   for (sum = 0; nwords > 0; nwords--) {
+      sum += *buf++;
+   }
+   sum = (sum >> 16) + (sum & 0xffff);
+   sum += (sum >> 16);
+
+   return ~sum;
+}
+
+_nwf_socket(int v6)
+{
+   int fd;
+
+   fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_RAW, IPPROTO_TCP);
+   if (fd < 0) {
+      memset(nwf_errbuf, 0, MAXERRBUF);
+      snprintf(nwf_errbuf, MAXERRBUF - 1, "_nwf_socket: %s", strerror(errno));
+      return(0);
+   }
+
+   return(fd);
+}
+
+int
+_nwf_inet_addr(const char *ip)
+{
+   in_addr_t a;
+
+   a = inet_addr(ip);
+   if (a == INADDR_NONE) {
+      memset(nwf_errbuf, 0, MAXERRBUF);
+      snprintf(nwf_errbuf, MAXERRBUF - 1, "_nwf_inet_addr: %s for [%s]",
+               strerror(errno), ip);
+      return(0);
+   }
+
+   return(a);
+}
+
+int
+_nwf_sendto(int sockfd, const void *buf, size_t len, int flags,
+            const struct sockaddr *dest_addr, socklen_t addrlen,
+            char *ip_dst)
+{
+   int r;
+
+   r = sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+   if (r < 0) {
+      memset(nwf_errbuf, 0, MAXERRBUF);
+      snprintf(nwf_errbuf, MAXERRBUF - 1, "_nwf_sendto: %s [to %s]",
+               strerror(errno), ip_dst);
+      return(0);
+   }
+
+   return(1);
+}
+
+void *
+_nwf_malloc(size_t size)
+{
+   void *ptr;
+
+   ptr = malloc(size);
+   if (ptr == NULL) {
+      memset(nwf_errbuf, 0, MAXERRBUF);
+      snprintf(nwf_errbuf, MAXERRBUF - 1, "_nwf_malloc: %s", strerror(errno));
+      return(NULL);
+   }
+
+   return(ptr);
+}
+
+int
+_nwf_getaddrinfo(const char *node, const char *service,
+                 const struct addrinfo *hints, struct addrinfo **res)
+{
+   int r;
+
+   r = getaddrinfo(node, service, hints, res);
+   if (r < 0) {
+      memset(nwf_errbuf, 0, MAXERRBUF);
+      snprintf(nwf_errbuf, MAXERRBUF - 1, "_nwf_getaddrinfo: %s [%s]",
+               gai_strerror(r), node);
+      return(0);
+   }
+
+   return(1);
+}
+
+int
+l4_send_tcp_syn(char *ip_src, char *ip_dst, int *ports, int nports, int pps,
+                int v6)
+{
+   int r;
+   int fd;
+   int i;
+   int nwords;
+   in_addr_t adst;
+   in_addr_t asrc;
+   u_int8_t datagram[TCP_LEN];
+   u_int8_t pdatagram[TCP_LEN + TCP_PHDR4_LEN];
+   struct sockaddr_in sin;
+   time_t begin;
+   time_t now;
+   int apps = pps; // Adjusted pps
+
+   if (nwf_isrand == 0) {
+      srand(time(NULL));
+      nwf_isrand++;
+   }
+
+   struct ptcphdr4 *ptcph = (struct ptcphdr4 *)pdatagram;
+   struct tcphdr   *tcph  = (struct tcphdr *) (pdatagram + TCP_PHDR4_LEN);
+
+   adst = _nwf_inet_addr(ip_dst);
+   if (adst == 0) {
+      return(0);
+   }
+
+   asrc = _nwf_inet_addr(ip_src);
+   if (asrc == 0) {
+      return(0);
+   }
+
+   memset(&sin, 0, sizeof(struct sockaddr_in));
+   sin.sin_family      = AF_INET;
+   sin.sin_addr.s_addr = adst;
+
+   memset(datagram,  0, TCP_LEN);
+   memset(pdatagram, 0, TCP_PHDR4_LEN + TCP_LEN);
+
+   ptcph->ip_src  = asrc;
+   ptcph->ip_dst  = adst;
+   ptcph->ip_p    = ntohs(6);
+   ptcph->tcp_len = ntohs(TCP_LEN);
+
+   ptcph->tcp_hdr.th_ack   = 0;
+   ptcph->tcp_hdr.th_x2    = 0;
+   ptcph->tcp_hdr.th_off   = TCP_LEN >> 2;
+   ptcph->tcp_hdr.th_flags = 0x02; // TCP SYN
+   ptcph->tcp_hdr.th_win   = htons(5840);
+   ptcph->tcp_hdr.th_sum   = 0;
+   ptcph->tcp_hdr.th_urp   = 0;
+
+   //memcpy(ptcph->tcp_opt, "\x02\x04\x05\xb4", TCP_OPT_LEN);
+   memcpy(ptcph->tcp_opt, "\x02\x04\x05\xb4\x08\x0a\x44\x45\x41\x44\x00\x00\x00\x00\x03\x03\x01\x04\x02\x00", TCP_OPT_LEN);
+
+   fd = _nwf_socket(v6);
+   if (fd == 0) {
+      return(0);
+   }
+
+   begin = time(NULL);
+   int count = 0;
+   for (i=0; i<nports; i++) {
+      ptcph->tcp_hdr.th_sport = htons(random());
+      ptcph->tcp_hdr.th_dport = htons(ports[i]);
+      ptcph->tcp_hdr.th_seq   = random();
+
+      // Compute checksums
+      nwords                = (TCP_LEN + TCP_PHDR4_LEN) * 8 / 16;
+      ptcph->tcp_hdr.th_sum = _nwf_csum((u_int16_t *)ptcph, nwords);
+
+      memcpy(datagram, tcph, TCP_LEN);
+
+      sin.sin_port = htons(ports[i]);
+      r = _nwf_sendto(fd, (u_int16_t *)datagram, TCP_LEN, 0,
+                      (const struct sockaddr *)&sin, sizeof(struct sockaddr),
+                      ip_dst);
+      if (r == 0) {
+         fprintf(stderr, "WARNING: %s\n", nwf_errbuf);
+         continue;
+      }
+      count++;
+
+      // Adjust pps rate to match local clock
+      now = time(NULL);
+      if (now - begin >= 1) {
+         printf("Sent %d pps (i/o %d pps)\n", count, pps);
+         if (count < pps) {
+            apps += (pps - count) * (pps / 1000);
+         }
+         else if (count > pps) {
+            apps -= (count - pps) * (pps / 1000);
+         }
+         begin = time(NULL);
+         count = 0;
+      }
+ 
+      // Sleep between each packet to achieve our packet per second rate
+      usleep(1000000 / apps);
+
+      // Reset checksum for next round
+      ptcph->tcp_hdr.th_sum = 0;
+   }
+
+   close(fd);
+
+   return(1);
+}
+
+int
+l4_send_tcp_syn_multi(char *ip_src, char **ip_dst, int ndst, int *ports,
+                      int nports, int pps, int n, int v6)
+{
+   int r;
+   int fd;
+   int i;
+   int j;
+   int k;
+   int nwords;
+   struct addrinfo hints;
+   struct addrinfo *asrc;
+   struct addrinfo *adst;
+   struct sockaddr_in  *ptr4;
+   struct sockaddr_in6 *ptr6;
+   u_int8_t datagram[TCP_LEN];
+   u_int8_t *pdatagram;
+   time_t begin;
+   time_t now;
+   int count;
+   int apps = pps; // Adjusted pps
+   struct ptcphdr4 *ptcph4;
+   struct ptcphdr6 *ptcph6;
+   struct tcphdr   *tcph;
+
+   if (! v6) {
+      pdatagram = (u_int8_t *)_nwf_malloc(TCP_LEN + TCP_PHDR4_LEN);
+      if (pdatagram == NULL)
+         return(0);
+      ptcph4    = (struct ptcphdr4 *)pdatagram;
+      tcph      = (struct tcphdr *) (pdatagram + TCP_PHDR4_LEN);
+   }
+   else {
+      pdatagram = (u_int8_t *)_nwf_malloc(TCP_LEN + TCP_PHDR6_LEN);
+      if (pdatagram == NULL)
+         return(0);
+      ptcph6    = (struct ptcphdr6 *)pdatagram;
+      tcph      = (struct tcphdr *) (pdatagram + TCP_PHDR6_LEN);
+   }
+
+   if (nwf_isrand == 0) {
+      srand(time(NULL));
+      nwf_isrand++;
+   }
+
+   memset(&hints, 0, sizeof(hints));
+   if (! v6) {
+      hints.ai_family = AF_INET;
+   }
+   else {
+      hints.ai_family = AF_INET6;
+   }
+   hints.ai_flags    = AI_NUMERICHOST;
+   hints.ai_socktype = SOCK_RAW;
+   hints.ai_protocol = IPPROTO_RAW;
+
+   asrc = (struct addrinfo *)_nwf_malloc(sizeof(struct addrinfo));
+   if (asrc == NULL) {
+      free(pdatagram);
+      return(0);
+   }
+   r = _nwf_getaddrinfo(ip_src, NULL, &hints, &asrc);
+   if (r == 0) {
+      freeaddrinfo(asrc);
+      free(pdatagram);
+      return(0);
+   }
+
+   memset(datagram, 0, TCP_LEN);
+   if (! v6) {
+      memset(pdatagram, 0, TCP_PHDR4_LEN + TCP_LEN);
+   }
+   else {
+      memset(pdatagram, 0, TCP_PHDR6_LEN + TCP_LEN);
+   }
+
+   if (! v6) {
+      ptr4 = (struct sockaddr_in *)asrc->ai_addr;
+      memcpy(&(ptcph4->ip_src), &(ptr4->sin_addr), 4);
+      ptcph4->ip_p             = ntohs(6);
+      ptcph4->tcp_len          = ntohs(TCP_LEN);
+      ptcph4->tcp_hdr.th_ack   = 0;
+      ptcph4->tcp_hdr.th_x2    = 0;
+      ptcph4->tcp_hdr.th_off   = TCP_LEN >> 2;
+      ptcph4->tcp_hdr.th_flags = 0x02;
+      ptcph4->tcp_hdr.th_win   = htons(5840);
+      ptcph4->tcp_hdr.th_sum   = 0;
+      ptcph4->tcp_hdr.th_urp   = 0;
+      // MSS 1460
+      //memcpy(ptcph4->tcp_opt, "\x02\x04\x05\xb4", TCP_OPT_LEN);
+      memcpy(ptcph4->tcp_opt, "\x02\x04\x05\xb4\x08\x0a\x44\x45\x41\x44\x00\x00\x00\x00\x03\x03\x01\x04\x02\x00", TCP_OPT_LEN);
+   }
+   else {
+      ptr6 = (struct sockaddr_in6 *)asrc->ai_addr;
+      memcpy(&(ptcph6->ip_src), &(ptr6->sin6_addr), 16);
+      ptcph6->ip_p             = ntohs(6);
+      ptcph6->tcp_len          = ntohs(TCP_LEN);
+      ptcph6->tcp_hdr.th_ack   = 0;
+      ptcph6->tcp_hdr.th_x2    = 0;
+      ptcph6->tcp_hdr.th_off   = TCP_LEN >> 2;
+      ptcph6->tcp_hdr.th_flags = 0x02;
+      ptcph6->tcp_hdr.th_win   = htons(5840);
+      ptcph6->tcp_hdr.th_sum   = 0;
+      ptcph6->tcp_hdr.th_urp   = 0;
+      // MSS 1460
+      //memcpy(ptcph6->tcp_opt, "\x02\x04\x05\xb4", TCP_OPT_LEN);
+      memcpy(ptcph6->tcp_opt, "\x02\x04\x05\xb4\x08\x0a\x44\x45\x41\x44\x00\x00\x00\x00\x03\x03\x01\x04\x02\x00", TCP_OPT_LEN);
+   }
+
+   fd = _nwf_socket(v6);
+   if (fd == 0) {
+      freeaddrinfo(asrc);
+      free(pdatagram);
+      return(0);
+   }
+
+   begin = time(NULL);
+   count = 0;
+   for (i=0; i<nports; i++) {
+      if (! v6) {
+         ptcph4->tcp_hdr.th_sport = htons(random());
+         ptcph4->tcp_hdr.th_dport = htons(ports[i]);
+         ptcph4->tcp_hdr.th_seq   = random();
+      }
+      else {
+         ptcph6->tcp_hdr.th_sport = htons(random());
+         ptcph6->tcp_hdr.th_dport = htons(ports[i]);
+         ptcph6->tcp_hdr.th_seq   = random();
+      }
+
+      for (j=0; j<ndst; j++) {
+         //printf("Target [%s]:%d [ipv6:%d]\n", ip_dst[j], ports[i], v6);
+
+         adst = (struct addrinfo *)_nwf_malloc(sizeof(struct addrinfo));
+         if (adst == NULL) {
+            freeaddrinfo(asrc);
+            free(pdatagram);
+            return(0);
+         }
+         r = _nwf_getaddrinfo(ip_dst[j], NULL, &hints, &adst);
+         if (r == 0) {
+            freeaddrinfo(asrc);
+            freeaddrinfo(adst);
+            free(pdatagram);
+            return(0);
+         }
+
+         if (! v6) {
+            ptr4 = (struct sockaddr_in *)adst->ai_addr;
+            memcpy(&(ptcph4->ip_dst), &(ptr4->sin_addr), sizeof(in_addr_t));
+            // Compute checksums
+            nwords                 = (TCP_LEN + TCP_PHDR4_LEN) * 8 / 16;
+            ptcph4->tcp_hdr.th_sum = _nwf_csum((u_int16_t *)ptcph4, nwords);
+         }
+         else {
+            ptr6 = (struct sockaddr_in6 *)adst->ai_addr;
+            memcpy(&(ptcph6->ip_dst), &(ptr6->sin6_addr), 16);
+            // Compute checksums
+            nwords                 = (TCP_LEN + TCP_PHDR6_LEN) * 8 / 16;
+            ptcph6->tcp_hdr.th_sum = _nwf_csum((u_int16_t *)ptcph6, nwords);
+         }
+
+         memcpy(datagram, tcph, TCP_LEN);
+
+         for (k=0; k<n; k++) {
+            r = _nwf_sendto(fd, (u_int8_t *)datagram, TCP_LEN, 0,
+                            adst->ai_addr, adst->ai_addrlen,
+                            ip_dst[j]);
+            if (r == 0) {
+#ifdef DEBUG
+               fprintf(stderr, "WARNING: %s\n", nwf_errbuf);
+#endif
+               freeaddrinfo(adst);
+               continue;
+            }
+            count++;
+
+            // Adjust pps rate to match local clock
+            now = time(NULL);
+            if (now - begin >= 1) {
+#ifdef DEBUG
+               printf("Sent %d pps (i/o %d pps)\n", count, pps);
+#endif
+               if (count < pps) {
+                  apps += (pps - count) * (pps / 1000);
+               }
+               else if (count > pps) {
+                  apps -= (count - pps) * (pps / 1000);
+               }
+               begin = time(NULL);
+               count = 0;
+            }
+ 
+            // Sleep between each packet to achieve our packet per second rate
+            usleep(1000000 / apps);
+         }
+
+         // Reset checksum for next round
+         if (! v6) {
+            ptcph4->tcp_hdr.th_sum = 0;
+         }
+         else {
+            ptcph6->tcp_hdr.th_sum = 0;
+         }
+         freeaddrinfo(adst);
+      }
+   }
+   freeaddrinfo(asrc);
+   free(pdatagram);
+
+   close(fd);
+
+   return(1);
+}
+
+char *
+nwf_geterror(void)
+{
+   return((char *)nwf_errbuf);
+}
+
+MODULE = Net::Write::Fast  PACKAGE = Net::Write::Fast
+PROTOTYPES: DISABLE
+
+int
+l4_send_tcp_syn(src, dst, ports, pps, v6)
+      char *src
+      char *dst
+      SV   *ports
+      int   pps
+      int   v6
+   PREINIT:
+      if (!SvROK(ports) || SvTYPE((SV *)SvRV(ports)) != SVt_PVAV) {
+         croak("Argument ports shall be an ARRAYREF");
+      }
+   INIT:
+      int i;
+      AV *a = (AV *)SvRV(ports);
+      int len = av_len(a) + 1;
+      int *cports;
+      Newx(cports, len, int);
+   CODE:
+      for (i=0; i<len; i++) {
+         SV **e = av_fetch(a, i, 0);
+         cports[i] = SvIV(*e);
+      }
+      RETVAL = l4_send_tcp_syn(src, dst, cports, len, pps, v6);
+   OUTPUT:
+      RETVAL
+
+int
+l4_send_tcp_syn_multi(src, dst, ports, pps, n, v6)
+      char *src
+      SV   *dst
+      SV   *ports
+      int   pps
+      int   n
+      int   v6
+   PREINIT:
+      if (!SvROK(ports) || SvTYPE((SV *)SvRV(ports)) != SVt_PVAV) {
+         croak("Argument ports shall be an ARRAYREF");
+      }
+      if (!SvROK(dst) || SvTYPE((SV *)SvRV(dst)) != SVt_PVAV) {
+         croak("Argument dst shall be an ARRAYREF");
+      }
+   INIT:
+      int i;
+      AV *p = (AV *)SvRV(ports);
+      AV *d = (AV *)SvRV(dst);
+      int plen = av_len(p) + 1;
+      int dlen = av_len(d) + 1;
+      int *cports;
+      char *targets[dlen];
+      Newx(cports, plen, int);
+   CODE:
+      for (i=0; i<plen; i++) {
+         SV **e = av_fetch(p, i, 0);
+         cports[i] = SvIV(*e);
+      }
+      for (i=0; i<dlen; i++) {
+         STRLEN l;
+         targets[i] = SvPV(*av_fetch(d, i, 0), l);
+      }
+      RETVAL = l4_send_tcp_syn_multi(src, targets, dlen, cports, plen, pps, n,
+                                     v6);
+   OUTPUT:
+      RETVAL
+
+char *
+nwf_geterror()
