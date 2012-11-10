@@ -1,6 +1,5 @@
 Changes
 examples/tcp-scan-multi.pl
-examples/tcp-scan.pl
 examples/tcp-syn6.pl
 Fast.xs
 lib/Net/Write/Fast.pm

@@ -1,4 +1,4 @@
-/* $Id: Fast.xs 10 2011-11-16 22:03:53Z gomor $ */
+/* $Id: Fast.xs 26 2012-11-10 16:34:28Z gomor $ */
 
 #include "EXTERN.h"
 #include "perl.h"
@@ -14,7 +14,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 
-//#define DEBUG  1
+#define DEBUG  1
 
 //#define TCP_LEN       24
 //#define TCP_OPT_LEN    4
@@ -72,8 +72,10 @@ _nwf_csum(u_int16_t *buf, int nwords)
    return ~sum;
 }
 
-_nwf_socket(int v6)
+int
+_nwf_socket(int v6, struct addrinfo *asrc)
 {
+   int r;
    int fd;
 
    fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_RAW, IPPROTO_TCP);
@@ -81,6 +83,16 @@ _nwf_socket(int v6)
       memset(nwf_errbuf, 0, MAXERRBUF);
       snprintf(nwf_errbuf, MAXERRBUF - 1, "_nwf_socket: %s", strerror(errno));
       return(0);
+   }
+
+   if (asrc != NULL) {
+      r = bind(fd, (const struct sockaddr *)asrc->ai_addr, asrc->ai_addrlen);
+      if (r < 0) {
+         memset(nwf_errbuf, 0, MAXERRBUF);
+         snprintf(nwf_errbuf, MAXERRBUF - 1, "_nwf_socket: bind: %s", 
+            strerror(errno));
+         return(0);
+      }
    }
 
    return(fd);
@@ -153,118 +165,6 @@ _nwf_getaddrinfo(const char *node, const char *service,
 }
 
 int
-l4_send_tcp_syn(char *ip_src, char *ip_dst, int *ports, int nports, int pps,
-                int v6)
-{
-   int r;
-   int fd;
-   int i;
-   int nwords;
-   in_addr_t adst;
-   in_addr_t asrc;
-   u_int8_t datagram[TCP_LEN];
-   u_int8_t pdatagram[TCP_LEN + TCP_PHDR4_LEN];
-   struct sockaddr_in sin;
-   time_t begin;
-   time_t now;
-   int apps = pps; // Adjusted pps
-
-   if (nwf_isrand == 0) {
-      srand(time(NULL));
-      nwf_isrand++;
-   }
-
-   struct ptcphdr4 *ptcph = (struct ptcphdr4 *)pdatagram;
-   struct tcphdr   *tcph  = (struct tcphdr *) (pdatagram + TCP_PHDR4_LEN);
-
-   adst = _nwf_inet_addr(ip_dst);
-   if (adst == 0) {
-      return(0);
-   }
-
-   asrc = _nwf_inet_addr(ip_src);
-   if (asrc == 0) {
-      return(0);
-   }
-
-   memset(&sin, 0, sizeof(struct sockaddr_in));
-   sin.sin_family      = AF_INET;
-   sin.sin_addr.s_addr = adst;
-
-   memset(datagram,  0, TCP_LEN);
-   memset(pdatagram, 0, TCP_PHDR4_LEN + TCP_LEN);
-
-   ptcph->ip_src  = asrc;
-   ptcph->ip_dst  = adst;
-   ptcph->ip_p    = ntohs(6);
-   ptcph->tcp_len = ntohs(TCP_LEN);
-
-   ptcph->tcp_hdr.th_ack   = 0;
-   ptcph->tcp_hdr.th_x2    = 0;
-   ptcph->tcp_hdr.th_off   = TCP_LEN >> 2;
-   ptcph->tcp_hdr.th_flags = 0x02; // TCP SYN
-   ptcph->tcp_hdr.th_win   = htons(5840);
-   ptcph->tcp_hdr.th_sum   = 0;
-   ptcph->tcp_hdr.th_urp   = 0;
-
-   //memcpy(ptcph->tcp_opt, "\x02\x04\x05\xb4", TCP_OPT_LEN);
-   memcpy(ptcph->tcp_opt, "\x02\x04\x05\xb4\x08\x0a\x44\x45\x41\x44\x00\x00\x00\x00\x03\x03\x01\x04\x02\x00", TCP_OPT_LEN);
-
-   fd = _nwf_socket(v6);
-   if (fd == 0) {
-      return(0);
-   }
-
-   begin = time(NULL);
-   int count = 0;
-   for (i=0; i<nports; i++) {
-      ptcph->tcp_hdr.th_sport = htons(random());
-      ptcph->tcp_hdr.th_dport = htons(ports[i]);
-      ptcph->tcp_hdr.th_seq   = random();
-
-      // Compute checksums
-      nwords                = (TCP_LEN + TCP_PHDR4_LEN) * 8 / 16;
-      ptcph->tcp_hdr.th_sum = _nwf_csum((u_int16_t *)ptcph, nwords);
-
-      memcpy(datagram, tcph, TCP_LEN);
-
-      sin.sin_port = htons(ports[i]);
-      r = _nwf_sendto(fd, (u_int16_t *)datagram, TCP_LEN, 0,
-                      (const struct sockaddr *)&sin, sizeof(struct sockaddr),
-                      ip_dst);
-      if (r == 0) {
-         fprintf(stderr, "WARNING: %s\n", nwf_errbuf);
-         continue;
-      }
-      count++;
-
-      // Adjust pps rate to match local clock
-      now = time(NULL);
-      if (now - begin >= 1) {
-         printf("Sent %d pps (i/o %d pps)\n", count, pps);
-         if (count < pps) {
-            apps += (pps - count) * (pps / 1000);
-         }
-         else if (count > pps) {
-            apps -= (count - pps) * (pps / 1000);
-         }
-         begin = time(NULL);
-         count = 0;
-      }
- 
-      // Sleep between each packet to achieve our packet per second rate
-      usleep(1000000 / apps);
-
-      // Reset checksum for next round
-      ptcph->tcp_hdr.th_sum = 0;
-   }
-
-   close(fd);
-
-   return(1);
-}
-
-int
 l4_send_tcp_syn_multi(char *ip_src, char **ip_dst, int ndst, int *ports,
                       int nports, int pps, int n, int v6)
 {
@@ -284,7 +184,11 @@ l4_send_tcp_syn_multi(char *ip_src, char **ip_dst, int ndst, int *ports,
    time_t begin;
    time_t now;
    int count;
-   int apps = pps; // Adjusted pps
+   int scount;
+   int npackets = 0; // Total number of packets
+   int runtime  = 0; // Estimated running time
+   int every    = 0; // Sleep every number of packets
+   int us       = 0; // Sleep time in us (minimum 10ms, per classic OS)
    struct ptcphdr4 *ptcph4;
    struct ptcphdr6 *ptcph6;
    struct tcphdr   *tcph;
@@ -373,15 +277,25 @@ l4_send_tcp_syn_multi(char *ip_src, char **ip_dst, int ndst, int *ports,
       memcpy(ptcph6->tcp_opt, "\x02\x04\x05\xb4\x08\x0a\x44\x45\x41\x44\x00\x00\x00\x00\x03\x03\x01\x04\x02\x00", TCP_OPT_LEN);
    }
 
-   fd = _nwf_socket(v6);
+   fd = _nwf_socket(v6, asrc);
    if (fd == 0) {
       freeaddrinfo(asrc);
       free(pdatagram);
       return(0);
    }
 
-   begin = time(NULL);
-   count = 0;
+   begin    = time(NULL);
+   count    = 0;
+   scount   = 0;
+   npackets = nports * ndst * n;
+   runtime  = npackets / pps;
+   us       = 10000; // Minimum delay 10ms, per classic OS restiction
+   every    = ((float)pps / (float)us) * 100.00;
+#ifdef DEBUG
+   fprintf(stderr,
+      "Using usleep of %d every %d packets during a runtime of %d seconds\n",
+           us, every, runtime);
+#endif
    for (i=0; i<nports; i++) {
       if (! v6) {
          ptcph4->tcp_hdr.th_sport = htons(random());
@@ -440,26 +354,25 @@ l4_send_tcp_syn_multi(char *ip_src, char **ip_dst, int ndst, int *ports,
                continue;
             }
             count++;
+            scount++;
 
-            // Adjust pps rate to match local clock
+            // Sleep every X packet
+            if (scount > every) {
+               usleep(us);
+               scount = 0;
+            }
+
+#ifdef DEBUG
+            // Print stats and reset count
             now = time(NULL);
             if (now - begin >= 1) {
-#ifdef DEBUG
-               printf("Sent %d pps (i/o %d pps)\n", count, pps);
-#endif
-               if (count < pps) {
-                  apps += (pps - count) * (pps / 1000);
-               }
-               else if (count > pps) {
-                  apps -= (count - pps) * (pps / 1000);
-               }
+               fprintf(stderr, "Sent %d pps (i/o %d pps), time to sleep %d us (total: %d)\n",
+                       count, pps, us, npackets);
                begin = time(NULL);
                count = 0;
             }
- 
-            // Sleep between each packet to achieve our packet per second rate
-            usleep(1000000 / apps);
          }
+#endif
 
          // Reset checksum for next round
          if (! v6) {
@@ -487,32 +400,6 @@ nwf_geterror(void)
 
 MODULE = Net::Write::Fast  PACKAGE = Net::Write::Fast
 PROTOTYPES: DISABLE
-
-int
-l4_send_tcp_syn(src, dst, ports, pps, v6)
-      char *src
-      char *dst
-      SV   *ports
-      int   pps
-      int   v6
-   PREINIT:
-      if (!SvROK(ports) || SvTYPE((SV *)SvRV(ports)) != SVt_PVAV) {
-         croak("Argument ports shall be an ARRAYREF");
-      }
-   INIT:
-      int i;
-      AV *a = (AV *)SvRV(ports);
-      int len = av_len(a) + 1;
-      int *cports;
-      Newx(cports, len, int);
-   CODE:
-      for (i=0; i<len; i++) {
-         SV **e = av_fetch(a, i, 0);
-         cports[i] = SvIV(*e);
-      }
-      RETVAL = l4_send_tcp_syn(src, dst, cports, len, pps, v6);
-   OUTPUT:
-      RETVAL
 
 int
 l4_send_tcp_syn_multi(src, dst, ports, pps, n, v6)
