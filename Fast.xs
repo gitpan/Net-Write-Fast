@@ -14,7 +14,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 
-#define DEBUG  1
+//#define DEBUG  1
 
 //#define TCP_LEN       24
 //#define TCP_OPT_LEN    4
@@ -181,8 +181,10 @@ l4_send_tcp_syn_multi(char *ip_src, char **ip_dst, int ndst, int *ports,
    struct sockaddr_in6 *ptr6;
    u_int8_t datagram[TCP_LEN];
    u_int8_t *pdatagram;
+#ifdef DEBUG
    time_t begin;
    time_t now;
+#endif
    int count;
    int scount;
    int npackets = 0; // Total number of packets
@@ -284,7 +286,9 @@ l4_send_tcp_syn_multi(char *ip_src, char **ip_dst, int ndst, int *ports,
       return(0);
    }
 
+#ifdef DEBUG
    begin    = time(NULL);
+#endif
    count    = 0;
    scount   = 0;
    npackets = nports * ndst * n;
@@ -371,8 +375,8 @@ l4_send_tcp_syn_multi(char *ip_src, char **ip_dst, int ndst, int *ports,
                begin = time(NULL);
                count = 0;
             }
-         }
 #endif
+         }
 
          // Reset checksum for next round
          if (! v6) {

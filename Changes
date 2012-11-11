@@ -1,10 +1,16 @@
 Revision history for Perl extension Net::Write::Fast.
 
+0.14 Sun Nov 11 11:48:59 CET 2012
+   - bugfix: on pod regression
+   - bugfix: an endif was badly splaced, and Fast.xs refused to compile when
+             DEBUG was off
+   - update: turned off debug mode
+
 0.13 Sat Nov 10 17:33:18 CET 2012
    - bugfix: send algorithm, was limited at 500 pps (due to lack of Q&A)
    - new: can set source IP address when sending
    - obsolete: l4_send_tcp_syn()
-   - pod: documentation written
+   - pod: regression from version 0.12
 
 0.12 Sat Sep  8 10:13:35 CEST 2012
    - pod: documentation written

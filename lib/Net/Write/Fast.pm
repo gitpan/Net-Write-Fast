@@ -7,7 +7,7 @@ use warnings;
 
 use base qw(Exporter DynaLoader);
 
-our $VERSION = '0.13';
+our $VERSION = '0.14';
 
 __PACKAGE__->bootstrap($VERSION);
 
@@ -36,15 +36,38 @@ Net::Write::Fast - create and inject packets fast
 
 =head1 SYNOPSIS
 
+   use Net::Write::Fast;
+
+   # Sends multiple TCP SYNs to multiple IPv6 targets
+   my $r = Net::Write::Fast::l4_send_tcp_syn_multi(
+      "::1",            # IPv6 source
+      [ '::2', '::3' ], # IPv6 targets
+      [ 25, 80, 110 ],  # TCP port targets
+      200,              # Number of packet per second
+      3,                # Number of try
+      1,                # Use IPv6
+   );
+
+   # Handle errors
+   if ($r == 0) {
+      print STDERR "ERROR: ",Net::Write::Fast::nwf_geterror(),"\n";
+   }
+
 =head1 DESCRIPTION
+
+Sends network frames fast to the network.
 
 =head1 FUNCTIONS
 
 =over 4
 
-=item B<l4_send_tcp_syn_multi>
+=item B<l4_send_tcp_syn_multi> (ip_src, ip_dst arrayref, ip_dst count, ports arrayref, ports count, packets per second, try count, use IPv6 flag)
+
+Sends multiple TCP SYN at layer 4 to multiple IP targets. Returns 0 in case of failure, and sets error buffer to an error message.
 
 =item B<nwf_geterror>
+
+Get latest error message.
 
 =back
 
